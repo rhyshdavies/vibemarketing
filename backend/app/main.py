@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from .services.instantly import InstantlyService
 from .services.ai_copy import AICopyService
 from .services.firebase_service import FirebaseService
+from .services.unipile_service import UnipileService
 from .routes import domains
 
 load_dotenv()
@@ -32,6 +33,7 @@ app.add_middleware(
 # Initialize services
 instantly_service = InstantlyService(os.getenv("INSTANTLY_API_KEY"))
 ai_service = AICopyService(os.getenv("OPENAI_API_KEY"))
+unipile_service = UnipileService(os.getenv("UNIPILE_API_KEY"))
 
 # Firebase credentials from environment variable
 firebase_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -986,6 +988,194 @@ async def create_icp_campaign(request: ICPCampaignRequest):
             "X-Accel-Buffering": "no"
         }
     )
+
+
+class LinkedInCampaignRequest(BaseModel):
+    campaign_id: str
+    user_id: str
+    message: Optional[str] = None
+
+
+@app.get("/api/linkedin/accounts")
+async def get_linkedin_accounts():
+    """
+    Get all connected LinkedIn accounts from Unipile
+    """
+    try:
+        accounts = await unipile_service.get_linkedin_accounts()
+        return {
+            "success": True,
+            "accounts": accounts,
+            "has_account": len(accounts) > 0
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "has_account": False
+        }
+
+
+@app.post("/api/linkedin/connect")
+async def create_linkedin_auth_link():
+    """
+    Generate a hosted authentication link for connecting LinkedIn account
+    """
+    try:
+        auth_url = await unipile_service.create_hosted_auth_link(
+            provider="LINKEDIN",
+            success_redirect_url="http://localhost:4000/dashboard?linkedin_connected=true",
+            failure_redirect_url="http://localhost:4000/dashboard?linkedin_error=true"
+        )
+        return {
+            "success": True,
+            "auth_url": auth_url
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/linkedin/generate-message")
+async def generate_linkedin_message(request: LinkedInCampaignRequest):
+    """
+    Generate a LinkedIn message preview for the campaign
+    """
+    try:
+        # Get campaign data from Firebase
+        campaign_data = await db_service.get_campaign(request.user_id, request.campaign_id)
+
+        if not campaign_data:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        url = campaign_data.get("url")
+
+        # Generate LinkedIn message using OpenAI based on the website
+        prompt = f"""Based on this website: {url}
+
+Generate a professional LinkedIn message that would work for outreach to the target audience.
+
+The message should:
+- Be personalized and conversational
+- Be concise (under 150 words)
+- Include a clear value proposition
+- Have a soft call-to-action
+- Use [First Name] as a placeholder for personalization
+
+Do not include a subject line. Just the message body."""
+
+        message = await ai_service.generate_copy_with_openai(prompt)
+
+        return {
+            "success": True,
+            "message": message,
+            "url": url
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/linkedin/launch-campaign")
+async def launch_linkedin_campaign(request: LinkedInCampaignRequest):
+    """
+    Launch a LinkedIn campaign for existing email campaign
+    """
+    try:
+        # Step 1: Check if LinkedIn account is connected
+        linkedin_accounts = await unipile_service.get_linkedin_accounts()
+
+        if not linkedin_accounts:
+            return {
+                "success": False,
+                "needs_auth": True,
+                "message": "No LinkedIn account connected. Please connect your LinkedIn account first."
+            }
+
+        # Use first LinkedIn account
+        linkedin_account = linkedin_accounts[0]
+        account_id = linkedin_account.get("id")
+
+        # Step 2: Get campaign data from Firebase
+        campaign_data = await db_service.get_campaign(request.user_id, request.campaign_id)
+
+        if not campaign_data:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        # Step 3: Get leads from the campaign's supersearch list
+        supersearch_list_id = campaign_data.get("supersearch_list_id")
+
+        if not supersearch_list_id:
+            raise HTTPException(status_code=400, detail="Campaign has no leads associated")
+
+        # Get leads from SuperSearch
+        leads = await ai_service.get_supersearch_leads(supersearch_list_id)
+
+        if not leads or len(leads) == 0:
+            raise HTTPException(status_code=400, detail="No leads found for this campaign")
+
+        # Step 4: Use provided message or get from email copy
+        if request.message:
+            message_template = request.message
+        else:
+            # Fallback to email copy if no message provided
+            copy_variants = campaign_data.get("copy_variants", [])
+            if not copy_variants:
+                raise HTTPException(status_code=400, detail="No message provided and no email copy found for campaign")
+            first_variant = copy_variants[0]
+            message_template = first_variant.get("body", "")
+
+        # Step 5: Send LinkedIn messages to leads
+        sent_count = 0
+        failed_count = 0
+        results = []
+
+        for lead in leads[:10]:  # Limit to first 10 leads for testing
+            linkedin_url = lead.get("linkedin_url")
+
+            if not linkedin_url:
+                failed_count += 1
+                continue
+
+            try:
+                # Personalize message with lead's name
+                first_name = lead.get("first_name", "there")
+                personalized_message = message_template.replace("[First Name]", first_name)
+
+                # Send LinkedIn message
+                result = await unipile_service.send_linkedin_message(
+                    account_id=account_id,
+                    attendees=[linkedin_url],
+                    text=personalized_message
+                )
+
+                sent_count += 1
+                results.append({
+                    "lead": f"{first_name} {lead.get('last_name', '')}",
+                    "status": "sent"
+                })
+
+                # Wait between messages to avoid rate limiting
+                await asyncio.sleep(2)
+
+            except Exception as e:
+                failed_count += 1
+                results.append({
+                    "lead": f"{lead.get('first_name', '')} {lead.get('last_name', '')}",
+                    "status": "failed",
+                    "error": str(e)
+                })
+
+        return {
+            "success": True,
+            "sent_count": sent_count,
+            "failed_count": failed_count,
+            "total_leads": len(leads),
+            "results": results,
+            "message": f"LinkedIn campaign launched! Sent {sent_count} messages."
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

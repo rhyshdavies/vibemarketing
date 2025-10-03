@@ -20,14 +20,23 @@ class FirebaseService:
         """
         # Initialize Firebase app if not already initialized
         if not firebase_admin._apps:
-            if credentials_path:
+            if credentials_path and os.path.exists(credentials_path):
                 cred = credentials.Certificate(credentials_path)
                 firebase_admin.initialize_app(cred)
             else:
-                # Use default credentials from environment
-                firebase_admin.initialize_app()
+                # Use default credentials from environment or skip if not available
+                try:
+                    firebase_admin.initialize_app()
+                except Exception as e:
+                    print(f"⚠️  Warning: Firebase credentials not found. Some features may not work. Error: {e}")
+                    # Initialize with a dummy app to prevent errors
+                    firebase_admin.initialize_app(options={'projectId': 'dummy-project'})
 
-        self.db = firestore.client()
+        try:
+            self.db = firestore.client()
+        except Exception as e:
+            print(f"⚠️  Warning: Could not connect to Firestore. Database features disabled. Error: {e}")
+            self.db = None
 
     async def save_campaign(
         self,
@@ -41,6 +50,10 @@ class FirebaseService:
         """
         Save a new campaign to Firestore
         """
+        if not self.db:
+            print("⚠️  Firebase not available, skipping campaign save")
+            return {"id": campaign_id, "status": "pending"}
+
         data = {
             "user_id": user_id,
             "campaign_id": campaign_id,
@@ -79,6 +92,9 @@ class FirebaseService:
         """
         Get all campaigns for a user
         """
+        if not self.db:
+            return []
+
         campaigns_ref = self.db.collection("campaigns")
         query = campaigns_ref.where("user_id", "==", user_id)
 
@@ -100,10 +116,13 @@ class FirebaseService:
 
         return campaigns
 
-    async def get_campaign(self, campaign_id: str) -> Optional[Dict]:
+    async def get_campaign(self, user_id: str, campaign_id: str) -> Optional[Dict]:
         """
         Get a specific campaign
         """
+        if not self.db:
+            return None
+
         doc_ref = self.db.collection("campaigns").document(campaign_id)
         doc = doc_ref.get()
 

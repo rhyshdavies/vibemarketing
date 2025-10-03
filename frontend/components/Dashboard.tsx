@@ -83,10 +83,41 @@ export default function Dashboard() {
     loadDashboardData()
   }, [loadDashboardData])
 
-  const handleLaunchLinkedIn = (campaign: Campaign) => {
-    // TODO: Implement LinkedIn campaign launch
-    console.log('Launch LinkedIn campaign for:', campaign)
-    alert(`LinkedIn campaign launch for ${campaign.url} - Coming soon!`)
+  const handleLaunchLinkedIn = async (campaign: Campaign) => {
+    try {
+      // Check if LinkedIn account is connected
+      const accountsResponse = await axios.get(`${API_URL}/api/linkedin/accounts`)
+
+      if (!accountsResponse.data.has_account) {
+        // Need to connect LinkedIn account first
+        if (confirm('No LinkedIn account connected. Would you like to connect one now?')) {
+          const authResponse = await axios.post(`${API_URL}/api/linkedin/connect`)
+          if (authResponse.data.success) {
+            // Redirect to Unipile hosted auth
+            window.location.href = authResponse.data.auth_url
+          }
+        }
+        return
+      }
+
+      // Launch LinkedIn campaign
+      if (confirm(`Launch LinkedIn campaign for ${campaign.url}? This will send LinkedIn messages to the campaign's leads.`)) {
+        const response = await axios.post(`${API_URL}/api/linkedin/launch-campaign`, {
+          campaign_id: campaign.campaign_id,
+          user_id: user.id
+        })
+
+        if (response.data.success) {
+          alert(`LinkedIn campaign launched successfully! Sent ${response.data.sent_count} messages.`)
+          loadDashboardData() // Refresh dashboard
+        } else if (response.data.needs_auth) {
+          alert(response.data.message)
+        }
+      }
+    } catch (error: any) {
+      console.error('Error launching LinkedIn campaign:', error)
+      alert(`Failed to launch LinkedIn campaign: ${error.response?.data?.detail || error.message}`)
+    }
   }
 
   if (loading) {
