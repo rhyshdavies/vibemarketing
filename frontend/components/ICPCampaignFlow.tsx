@@ -885,6 +885,9 @@ export default function ICPCampaignFlow() {
         </div>
 
         <div className="flex gap-4 justify-center">
+          <button onClick={() => window.location.href = '/dashboard'} className="btn-secondary">
+            ← Back to Dashboard
+          </button>
           <a
             href={`https://app.instantly.ai/app/campaigns/${campaignId}`}
             target="_blank"

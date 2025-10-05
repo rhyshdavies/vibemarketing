@@ -6,6 +6,7 @@ from typing import Optional
 import os
 import json
 import asyncio
+import httpx
 from dotenv import load_dotenv
 
 from .services.instantly import InstantlyService
@@ -495,7 +496,11 @@ async def get_user_campaigns(user_id: str):
     Get all campaigns for a user
     """
     try:
+        print(f"[DEBUG] Fetching campaigns for user_id: {user_id}")
         campaigns = await db_service.get_user_campaigns(user_id)
+        print(f"[DEBUG] Found {len(campaigns)} campaigns")
+        if campaigns:
+            print(f"[DEBUG] First campaign: {campaigns[0].get('url', 'no url')}")
         return {
             "success": True,
             "campaigns": campaigns
@@ -994,6 +999,7 @@ class LinkedInCampaignRequest(BaseModel):
     campaign_id: str
     user_id: str
     message: Optional[str] = None
+    account_id: Optional[str] = None  # LinkedIn account to use
 
 
 @app.get("/api/linkedin/accounts")
@@ -1002,13 +1008,20 @@ async def get_linkedin_accounts():
     Get all connected LinkedIn accounts from Unipile
     """
     try:
+        print("[DEBUG] Fetching LinkedIn accounts from Unipile...")
         accounts = await unipile_service.get_linkedin_accounts()
-        return {
+        print(f"[DEBUG] LinkedIn accounts found: {len(accounts)}")
+        if accounts:
+            print(f"[DEBUG] First account: {accounts[0]}")
+        response = {
             "success": True,
             "accounts": accounts,
             "has_account": len(accounts) > 0
         }
+        print(f"[DEBUG] Returning response: {response}")
+        return response
     except Exception as e:
+        print(f"[DEBUG] Error fetching LinkedIn accounts: {str(e)}")
         return {
             "success": False,
             "error": str(e),
@@ -1016,16 +1029,28 @@ async def get_linkedin_accounts():
         }
 
 
+class LinkedInConnectRequest(BaseModel):
+    campaign_id: Optional[str] = None
+
+
 @app.post("/api/linkedin/connect")
-async def create_linkedin_auth_link():
+async def create_linkedin_auth_link(request: LinkedInConnectRequest):
     """
     Generate a hosted authentication link for connecting LinkedIn account
     """
     try:
+        # Build redirect URLs with campaign_id if provided
+        success_url = "http://localhost:3000/dashboard?linkedin_connected=true"
+        failure_url = "http://localhost:3000/dashboard?linkedin_error=true"
+
+        if request.campaign_id:
+            success_url += f"&campaign_id={request.campaign_id}"
+            failure_url += f"&campaign_id={request.campaign_id}"
+
         auth_url = await unipile_service.create_hosted_auth_link(
             provider="LINKEDIN",
-            success_redirect_url="http://localhost:4000/dashboard?linkedin_connected=true",
-            failure_redirect_url="http://localhost:4000/dashboard?linkedin_error=true"
+            success_redirect_url=success_url,
+            failure_redirect_url=failure_url
         )
         return {
             "success": True,
@@ -1038,7 +1063,7 @@ async def create_linkedin_auth_link():
 @app.post("/api/linkedin/generate-message")
 async def generate_linkedin_message(request: LinkedInCampaignRequest):
     """
-    Generate a LinkedIn message preview for the campaign
+    Generate a LinkedIn message preview for the campaign using web search to analyze the website
     """
     try:
         # Get campaign data from Firebase
@@ -1048,30 +1073,144 @@ async def generate_linkedin_message(request: LinkedInCampaignRequest):
             raise HTTPException(status_code=404, detail="Campaign not found")
 
         url = campaign_data.get("url")
+        target_audience = campaign_data.get("target_audience", "potential clients")
 
-        # Generate LinkedIn message using OpenAI based on the website
-        prompt = f"""Based on this website: {url}
+        # Generate LinkedIn message using OpenAI with web search to visit the website
+        prompt = f"""Visit {url} using web search and analyze what this company does, their products/services, and their value proposition.
 
-Generate a professional LinkedIn message that would work for outreach to the target audience.
+Write a cold LinkedIn connection note FROM this company ({url}) TO their target audience: {target_audience}.
 
-The message should:
-- Be personalized and conversational
-- Be concise (under 150 words)
-- Include a clear value proposition
-- Have a soft call-to-action
-- Use [First Name] as a placeholder for personalization
+CRITICAL FORMAT RULES - READ CAREFULLY:
+- Return ONLY the message text itself, starting with "Hi [First Name],"
+- Do NOT include any preamble, explanation, or introduction before the message
+- Do NOT include phrases like "Here's a message:" or "Here's a concise note:"
+- Do NOT include any commentary about the message
+- Do NOT include markdown code blocks or formatting
+- Your entire response should BE the message, nothing else
 
-Do not include a subject line. Just the message body."""
+MESSAGE CONTENT RULES:
+- Start with "Hi [First Name],"
+- Identify a specific pain point that {target_audience} faces
+- Explain how the company's product/service solves this pain point (based on what you learned from visiting {url})
+- Be MAXIMUM 200 characters total (this is critical for LinkedIn connection notes - keep it SHORT)
+- Include a soft call-to-action question at the end
+- Sound natural and conversational, not salesy or robotic
+- Do NOT include ANY signature, role name, or company name at the end
+- Do NOT include any URLs, links, or citations
 
-        message = await ai_service.generate_copy_with_openai(prompt)
+RESPONSE FORMAT:
+Your response must start with "Hi [First Name]," and end with a question mark. Nothing before, nothing after."""
+
+        # Use Responses API with web search
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"https://api.openai.com/v1/responses",
+                headers={
+                    "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "gpt-4o",
+                    "tools": [{"type": "web_search"}],
+                    "input": prompt
+                }
+            )
+
+            if response.status_code != 200:
+                raise HTTPException(status_code=500, detail=f"OpenAI API error: {response.text}")
+
+            result = response.json()
+
+            # Extract text from Responses API format
+            output_text = None
+            for item in result.get("output", []):
+                if item.get("type") == "message":
+                    content = item.get("content", [])
+                    if content and content[0].get("type") == "output_text":
+                        output_text = content[0].get("text")
+                        break
+
+            if not output_text:
+                raise HTTPException(status_code=500, detail="No message generated from OpenAI")
+
+            message = output_text.strip()
+
+            # Strip any preamble that OpenAI might have added
+            # Look for the actual message starting with "Hi [First Name],"
+            if "Hi [First Name]," in message:
+                # Extract everything from "Hi [First Name]," onwards
+                start_idx = message.find("Hi [First Name],")
+                message = message[start_idx:]
+
+                # If there's explanatory text before it, remove it
+                # Also remove any markdown code blocks
+                message = message.replace("```", "").strip()
+
+            return {
+                "success": True,
+                "message": message,
+                "url": url
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/linkedin/campaign-leads/{campaign_id}")
+async def get_campaign_leads(campaign_id: str, user_id: str, limit: int = 10):
+    """
+    Get leads from a campaign for preview
+    """
+    try:
+        # Get campaign data from Firebase
+        campaign_data = await db_service.get_campaign(user_id, campaign_id)
+
+        if not campaign_data:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        # Get leads from the campaign's supersearch list
+        supersearch_list_id = campaign_data.get("supersearch_list_id")
+
+        if not supersearch_list_id:
+            return {
+                "success": False,
+                "leads": [],
+                "message": "No lead list associated with this campaign"
+            }
+
+        # Get leads from Instantly
+        leads = await instantly_service.get_leads_from_list(supersearch_list_id, limit=limit)
+
+        # Filter to only include leads with LinkedIn URLs
+        # LinkedIn URL might be in 'linkedin_url', 'linkedin', or 'personalization.linkedin'
+        linkedin_leads = []
+        for lead in leads:
+            linkedin_url = (
+                lead.get("linkedin_url") or
+                lead.get("linkedin") or
+                lead.get("personalization", {}).get("linkedin") or
+                lead.get("personalization", {}).get("linkedIn") or
+                ""
+            )
+
+            if linkedin_url:
+                linkedin_leads.append({
+                    "first_name": lead.get("first_name", ""),
+                    "last_name": lead.get("last_name", ""),
+                    "email": lead.get("email", ""),
+                    "company": lead.get("company_name", lead.get("company", "")),
+                    "title": lead.get("personalization", {}).get("job title", lead.get("title", "")),
+                    "linkedin_url": linkedin_url
+                })
 
         return {
             "success": True,
-            "message": message,
-            "url": url
+            "leads": linkedin_leads,
+            "total": len(linkedin_leads)
         }
 
     except Exception as e:
+        print(f"Error getting campaign leads: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1107,8 +1246,8 @@ async def launch_linkedin_campaign(request: LinkedInCampaignRequest):
         if not supersearch_list_id:
             raise HTTPException(status_code=400, detail="Campaign has no leads associated")
 
-        # Get leads from SuperSearch
-        leads = await ai_service.get_supersearch_leads(supersearch_list_id)
+        # Get leads from Instantly
+        leads = await instantly_service.get_leads_from_list(supersearch_list_id, limit=100)
 
         if not leads or len(leads) == 0:
             raise HTTPException(status_code=400, detail="No leads found for this campaign")
@@ -1124,15 +1263,45 @@ async def launch_linkedin_campaign(request: LinkedInCampaignRequest):
             first_variant = copy_variants[0]
             message_template = first_variant.get("body", "")
 
-        # Step 5: Send LinkedIn messages to leads
+        # Step 5: Send LinkedIn messages or connection requests to leads
         sent_count = 0
+        connection_requests_sent = 0
         failed_count = 0
         results = []
 
+        print(f"[DEBUG] Starting to send messages to {len(leads[:10])} leads")
+        print(f"[DEBUG] Using account_id: {account_id}")
+        print(f"[DEBUG] Message template: {message_template[:100]}...")
+
         for lead in leads[:10]:  # Limit to first 10 leads for testing
-            linkedin_url = lead.get("linkedin_url")
+            # Check multiple possible field names for LinkedIn URL (same logic as campaign-leads endpoint)
+            linkedin_url = (
+                lead.get("linkedin_url") or
+                lead.get("linkedin") or
+                lead.get("personalization", {}).get("linkedin") or
+                lead.get("personalization", {}).get("linkedIn") or
+                ""
+            )
+
+            # Normalize LinkedIn URL format - ensure it starts with https://
+            if linkedin_url and not linkedin_url.startswith("http"):
+                if linkedin_url.startswith("linkedin.com"):
+                    linkedin_url = f"https://www.{linkedin_url}"
+                elif linkedin_url.startswith("www.linkedin.com"):
+                    linkedin_url = f"https://{linkedin_url}"
+
+            # Extract profile identifier from LinkedIn URL for Unipile
+            # From "https://www.linkedin.com/in/samantha-statham-acxs" -> "samantha-statham-acxs"
+            profile_id = linkedin_url
+            if linkedin_url and "/in/" in linkedin_url:
+                # Extract the part after /in/
+                profile_id = linkedin_url.split("/in/")[1].rstrip("/")
+                print(f"[DEBUG] Extracted profile ID: {profile_id}")
+
+            print(f"[DEBUG] Processing lead: {lead.get('email')} - LinkedIn URL: {linkedin_url} - Profile ID: {profile_id}")
 
             if not linkedin_url:
+                print(f"[DEBUG] Skipping lead {lead.get('email')} - no LinkedIn URL")
                 failed_count += 1
                 continue
 
@@ -1140,19 +1309,57 @@ async def launch_linkedin_campaign(request: LinkedInCampaignRequest):
                 # Personalize message with lead's name
                 first_name = lead.get("first_name", "there")
                 personalized_message = message_template.replace("[First Name]", first_name)
+                print(f"[DEBUG] Personalized message for {first_name}: {personalized_message}")
 
-                # Send LinkedIn message
-                result = await unipile_service.send_linkedin_message(
-                    account_id=account_id,
-                    attendees=[linkedin_url],
-                    text=personalized_message
-                )
+                # Try to send a direct message first (only works if already connected)
+                try:
+                    print(f"[DEBUG] Attempting to send direct message to {linkedin_url}")
+                    result = await unipile_service.send_linkedin_message(
+                        account_id=account_id,
+                        attendees=[linkedin_url],
+                        text=personalized_message
+                    )
+                    print(f"[DEBUG] Successfully sent direct message to {first_name}")
+                    sent_count += 1
+                    results.append({
+                        "lead": f"{first_name} {lead.get('last_name', '')}",
+                        "status": "message_sent",
+                        "type": "direct_message"
+                    })
+                except Exception as msg_error:
+                    # If message fails (likely not connected), send connection request with note
+                    print(f"[DEBUG] Direct message failed for {first_name}: {str(msg_error)}")
+                    error_msg = str(msg_error).lower()
+                    if ("not connected" in error_msg or "connection" in error_msg or "404" in error_msg or
+                        "invalid_recipient" in error_msg or "cannot be reached" in error_msg or "422" in error_msg):
+                        # Send connection request with the message as a note
+                        # Note: LinkedIn limits connection notes to 300 characters
+                        connection_note = personalized_message[:300] if len(personalized_message) > 300 else personalized_message
+                        print(f"[DEBUG] Sending connection request to {first_name} with note (length: {len(connection_note)})")
+                        print(f"[DEBUG] Request params - account_id: {account_id}, profile_identifier: {profile_id}")
 
-                sent_count += 1
-                results.append({
-                    "lead": f"{first_name} {lead.get('last_name', '')}",
-                    "status": "sent"
-                })
+                        try:
+                            # Use profile slug - Unipile will fetch the provider_id
+                            result = await unipile_service.send_linkedin_connection_request(
+                                account_id=account_id,
+                                profile_identifier=profile_id,
+                                message=connection_note
+                            )
+                            print(f"[DEBUG] Unipile connection request API response: {result}")
+                            print(f"[DEBUG] Successfully sent connection request to {first_name}")
+                            connection_requests_sent += 1
+                        except Exception as conn_error:
+                            print(f"[DEBUG] Connection request failed: {str(conn_error)}")
+                            raise conn_error
+                        results.append({
+                            "lead": f"{first_name} {lead.get('last_name', '')}",
+                            "status": "connection_request_sent",
+                            "type": "connection_request",
+                            "note": "Message sent as connection note"
+                        })
+                    else:
+                        # Other error - report as failed
+                        raise msg_error
 
                 # Wait between messages to avoid rate limiting
                 await asyncio.sleep(2)
@@ -1168,10 +1375,11 @@ async def launch_linkedin_campaign(request: LinkedInCampaignRequest):
         return {
             "success": True,
             "sent_count": sent_count,
+            "connection_requests_sent": connection_requests_sent,
             "failed_count": failed_count,
             "total_leads": len(leads),
             "results": results,
-            "message": f"LinkedIn campaign launched! Sent {sent_count} messages."
+            "message": f"LinkedIn campaign launched! Sent {sent_count} messages and {connection_requests_sent} connection requests."
         }
 
     except Exception as e:

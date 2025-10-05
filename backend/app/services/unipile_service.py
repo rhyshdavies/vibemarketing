@@ -2,6 +2,7 @@
 Unipile service for LinkedIn integration
 """
 import httpx
+import json
 from typing import List, Dict, Optional
 
 
@@ -22,17 +23,23 @@ class UnipileService:
                 f"{self.base_url}/accounts",
                 headers=self.headers
             )
-            
+
             if response.status_code == 200:
                 data = response.json()
-                return data.get("items", [])
+                print(f"[DEBUG Unipile] Full response: {json.dumps(data, indent=2)}")
+                accounts = data.get("items", [])
+                print(f"[DEBUG Unipile] Extracted {len(accounts)} accounts")
+                return accounts
             else:
                 raise Exception(f"Failed to list accounts: {response.text}")
 
     async def get_linkedin_accounts(self) -> List[Dict]:
         """Get all connected LinkedIn accounts"""
         accounts = await self.list_accounts()
-        return [acc for acc in accounts if acc.get("provider") == "LINKEDIN"]
+        # Filter by 'type' field, not 'provider' - Unipile uses 'type' for account type
+        linkedin_accounts = [acc for acc in accounts if acc.get("type") == "LINKEDIN"]
+        print(f"[DEBUG] Filtered LinkedIn accounts: {len(linkedin_accounts)} (from {len(accounts)} total)")
+        return linkedin_accounts
 
     async def create_hosted_auth_link(
         self,
@@ -110,3 +117,71 @@ class UnipileService:
                 return response.json()
             else:
                 raise Exception(f"Failed to send message: {response.text}")
+
+    async def get_linkedin_profile(
+        self,
+        account_id: str,
+        identifier: str
+    ) -> Dict:
+        """
+        Retrieve a LinkedIn user profile to get their provider_id
+
+        Args:
+            account_id: Unipile account ID
+            identifier: LinkedIn profile URL, public identifier, or internal ID
+
+        Returns:
+            User profile with provider_id
+        """
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{self.base_url}/users/{identifier}",
+                headers=self.headers,
+                params={"account_id": account_id}
+            )
+
+            if response.status_code == 200:
+                return response.json()
+            else:
+                raise Exception(f"Failed to get LinkedIn profile: {response.text}")
+
+    async def send_linkedin_connection_request(
+        self,
+        account_id: str,
+        profile_identifier: str,
+        message: Optional[str] = None
+    ) -> Dict:
+        """
+        Send a LinkedIn connection request with an optional note
+
+        Args:
+            account_id: Unipile account ID
+            profile_identifier: LinkedIn profile URL, slug, or provider ID
+            message: Optional connection request message/note (max 300 characters)
+        """
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # First, get the user's provider_id
+            print(f"[DEBUG Unipile] Fetching profile for identifier: {profile_identifier}")
+            profile = await self.get_linkedin_profile(account_id, profile_identifier)
+            provider_id = profile.get("provider_id")
+            print(f"[DEBUG Unipile] Got provider_id: {provider_id}")
+
+            payload = {
+                "account_id": account_id,
+                "provider_id": provider_id
+            }
+
+            if message:
+                # Truncate to 300 characters as per LinkedIn limits
+                payload["message"] = message[:300] if len(message) > 300 else message
+
+            response = await client.post(
+                f"{self.base_url}/users/invite",
+                headers=self.headers,
+                json=payload
+            )
+
+            if response.status_code in [200, 201]:
+                return response.json()
+            else:
+                raise Exception(f"Failed to send connection request: {response.text}")

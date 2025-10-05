@@ -42,6 +42,7 @@ export default function Dashboard() {
   const [campaigns, setCampaigns] = useState<Campaign[]>([])
   const [stats, setStats] = useState<Stats | null>(null)
   const [loading, setLoading] = useState(true)
+  const [hasLinkedInAccount, setHasLinkedInAccount] = useState<boolean | null>(null)
 
   const loadDashboardData = useCallback(async () => {
     try {
@@ -51,6 +52,8 @@ export default function Dashboard() {
       const campaignsResponse = await axios.get(`${API_URL}/api/campaigns`, {
         params: { user_id: user.id }
       })
+      console.log('[Dashboard] Campaigns response:', campaignsResponse.data)
+      console.log('[Dashboard] Setting campaigns:', campaignsResponse.data.campaigns?.length || 0)
       setCampaigns(campaignsResponse.data.campaigns || [])
 
       // Calculate stats
@@ -81,42 +84,225 @@ export default function Dashboard() {
 
   useEffect(() => {
     loadDashboardData()
+
+    // Check LinkedIn account status once on mount
+    const checkLinkedInAccount = async () => {
+      try {
+        const accountsResponse = await axios.get(`${API_URL}/api/linkedin/accounts`)
+        setHasLinkedInAccount(accountsResponse.data.has_account)
+      } catch (error) {
+        console.error('Error checking LinkedIn account:', error)
+      }
+    }
+    checkLinkedInAccount()
   }, [loadDashboardData])
+
+  // Separate effect for handling LinkedIn auth redirect
+  useEffect(() => {
+    console.log('[Redirect] Effect running, campaigns.length:', campaigns.length)
+
+    // Only run once campaigns are loaded
+    if (campaigns.length === 0) {
+      console.log('[Redirect] Waiting for campaigns to load...')
+      return
+    }
+
+    // Check if redirected back from LinkedIn auth with campaign_id
+    const urlParams = new URLSearchParams(window.location.search)
+    const linkedinConnected = urlParams.get('linkedin_connected')
+    const campaignId = urlParams.get('campaign_id')
+
+    console.log('[Redirect] URL params:', { linkedinConnected, campaignId })
+
+    if (linkedinConnected === 'true' && campaignId) {
+      // Find the campaign and auto-open the modal
+      const campaign = campaigns.find(c => c.campaign_id === campaignId)
+      console.log('[Redirect] Found campaign:', campaign?.url || 'NOT FOUND')
+
+      if (campaign) {
+        // Clear URL params
+        window.history.replaceState({}, '', '/dashboard')
+
+        // Mark LinkedIn as connected
+        setHasLinkedInAccount(true)
+
+        // Open modal at generate step
+        setLinkedInModal({
+          show: true,
+          campaign,
+          step: 'generate',
+          message: '',
+          loading: false,
+          leads: [],
+          previewLead: null
+        })
+      }
+    }
+  }, [campaigns])
+
+  const [linkedInModal, setLinkedInModal] = useState<{
+    show: boolean
+    campaign: Campaign | null
+    step: 'select-account' | 'generate' | 'preview' | 'confirm'
+    message: string
+    loading: boolean
+    leads: any[]
+    previewLead: any | null
+    accounts: any[]
+    selectedAccount: any | null
+  }>({
+    show: false,
+    campaign: null,
+    step: 'select-account',
+    message: '',
+    loading: false,
+    leads: [],
+    previewLead: null,
+    accounts: [],
+    selectedAccount: null
+  })
 
   const handleLaunchLinkedIn = async (campaign: Campaign) => {
     try {
-      // Check if LinkedIn account is connected
+      // Always fetch the current list of LinkedIn accounts
       const accountsResponse = await axios.get(`${API_URL}/api/linkedin/accounts`)
+      const accounts = accountsResponse.data.accounts || []
 
-      if (!accountsResponse.data.has_account) {
-        // Need to connect LinkedIn account first
-        if (confirm('No LinkedIn account connected. Would you like to connect one now?')) {
-          const authResponse = await axios.post(`${API_URL}/api/linkedin/connect`)
-          if (authResponse.data.success) {
-            // Redirect to Unipile hosted auth
-            window.location.href = authResponse.data.auth_url
+      // Show modal with account selection step
+      setLinkedInModal({
+        show: true,
+        campaign,
+        step: 'select-account',
+        message: '',
+        loading: false,
+        leads: [],
+        previewLead: null,
+        accounts,
+        selectedAccount: accounts.length > 0 ? accounts[0] : null
+      })
+    } catch (error: any) {
+      console.error('Error launching LinkedIn flow:', error)
+      alert(`Failed to start LinkedIn campaign: ${error.response?.data?.detail || error.message}`)
+    }
+  }
+
+  const handleConnectNewLinkedInAccount = async () => {
+    try {
+      const authResponse = await axios.post(`${API_URL}/api/linkedin/connect`, {
+        campaign_id: linkedInModal.campaign?.campaign_id
+      })
+      if (authResponse.data.success) {
+        // Redirect to Unipile hosted auth
+        window.location.href = authResponse.data.auth_url
+      }
+    } catch (error: any) {
+      console.error('Error connecting LinkedIn account:', error)
+      alert(`Failed to connect account: ${error.response?.data?.detail || error.message}`)
+    }
+  }
+
+  const handleContinueWithAccount = () => {
+    if (!linkedInModal.selectedAccount) return
+    // Move to generate step
+    setLinkedInModal({ ...linkedInModal, step: 'generate' })
+  }
+
+  const handleGenerateMessage = async () => {
+    if (!linkedInModal.campaign) return
+
+    try {
+      setLinkedInModal({ ...linkedInModal, loading: true })
+
+      // Generate message using web search
+      const messageResponse = await axios.post(`${API_URL}/api/linkedin/generate-message`, {
+        campaign_id: linkedInModal.campaign.campaign_id,
+        user_id: user.id
+      })
+
+      if (messageResponse.data.success) {
+        setLinkedInModal({
+          ...linkedInModal,
+          step: 'preview',
+          message: messageResponse.data.message,
+          loading: false
+        })
+      }
+    } catch (error: any) {
+      console.error('Error generating LinkedIn message:', error)
+      alert(`Failed to generate message: ${error.response?.data?.detail || error.message}`)
+      setLinkedInModal({ ...linkedInModal, loading: false })
+    }
+  }
+
+  const handleShowLeadPreview = async () => {
+    if (!linkedInModal.campaign) return
+
+    try {
+      setLinkedInModal({ ...linkedInModal, loading: true, step: 'confirm' })
+
+      // Fetch leads from campaign
+      const leadsResponse = await axios.get(
+        `${API_URL}/api/linkedin/campaign-leads/${linkedInModal.campaign.campaign_id}`,
+        {
+          params: {
+            user_id: user.id,
+            limit: 10
           }
         }
-        return
-      }
+      )
 
-      // Launch LinkedIn campaign
-      if (confirm(`Launch LinkedIn campaign for ${campaign.url}? This will send LinkedIn messages to the campaign's leads.`)) {
-        const response = await axios.post(`${API_URL}/api/linkedin/launch-campaign`, {
-          campaign_id: campaign.campaign_id,
-          user_id: user.id
+      if (leadsResponse.data.success) {
+        setLinkedInModal({
+          ...linkedInModal,
+          loading: false,
+          step: 'confirm',
+          leads: leadsResponse.data.leads || []
         })
+      } else {
+        // No leads found, still show confirm step
+        setLinkedInModal({
+          ...linkedInModal,
+          loading: false,
+          step: 'confirm',
+          leads: []
+        })
+      }
+    } catch (error: any) {
+      console.error('Error loading leads:', error)
+      setLinkedInModal({ ...linkedInModal, loading: false, step: 'confirm', leads: [] })
+    }
+  }
 
-        if (response.data.success) {
-          alert(`LinkedIn campaign launched successfully! Sent ${response.data.sent_count} messages.`)
-          loadDashboardData() // Refresh dashboard
-        } else if (response.data.needs_auth) {
-          alert(response.data.message)
-        }
+  const launchLinkedInCampaign = async () => {
+    if (!linkedInModal.campaign) return
+
+    try {
+      setLinkedInModal({ ...linkedInModal, loading: true })
+
+      const response = await axios.post(`${API_URL}/api/linkedin/launch-campaign`, {
+        campaign_id: linkedInModal.campaign.campaign_id,
+        user_id: user.id,
+        message: linkedInModal.message,
+        account_id: linkedInModal.selectedAccount?.id
+      })
+
+      if (response.data.success) {
+        const { sent_count, connection_requests_sent } = response.data
+        let message = 'LinkedIn campaign launched successfully!\n'
+        if (sent_count > 0) message += `✓ ${sent_count} direct message${sent_count > 1 ? 's' : ''} sent\n`
+        if (connection_requests_sent > 0) message += `✓ ${connection_requests_sent} connection request${connection_requests_sent > 1 ? 's' : ''} sent with your message`
+
+        alert(message)
+        setLinkedInModal({ show: false, campaign: null, step: 'generate', message: '', loading: false, leads: [], previewLead: null })
+        loadDashboardData() // Refresh dashboard
+      } else if (response.data.needs_auth) {
+        alert(response.data.message)
+        setLinkedInModal({ show: false, campaign: null, step: 'generate', message: '', loading: false, leads: [], previewLead: null })
       }
     } catch (error: any) {
       console.error('Error launching LinkedIn campaign:', error)
       alert(`Failed to launch LinkedIn campaign: ${error.response?.data?.detail || error.message}`)
+      setLinkedInModal({ show: false, campaign: null, step: 'generate', message: '', loading: false, leads: [] })
     }
   }
 
@@ -271,6 +457,290 @@ export default function Dashboard() {
           )}
         </div>
       </div>
+
+      {/* Message Preview Modal */}
+      {linkedInModal.previewLead && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-[60] p-4">
+          <div className="bg-white rounded-xl shadow-2xl max-w-lg w-full">
+            <div className="p-6 border-b border-gray-200">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-bold text-gray-900">Message Preview</h3>
+                <button
+                  onClick={() => setLinkedInModal({ ...linkedInModal, previewLead: null })}
+                  className="text-gray-400 hover:text-gray-600"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+            <div className="p-6">
+              <div className="mb-4">
+                <p className="text-sm text-gray-600 mb-2">Sending to:</p>
+                <div className="flex items-center gap-3 p-3 bg-gray-50 rounded-lg">
+                  <div className="w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 font-semibold">
+                    {linkedInModal.previewLead.first_name?.[0]}{linkedInModal.previewLead.last_name?.[0]}
+                  </div>
+                  <div>
+                    <p className="font-medium text-gray-900">
+                      {linkedInModal.previewLead.first_name} {linkedInModal.previewLead.last_name}
+                    </p>
+                    <p className="text-xs text-gray-600">{linkedInModal.previewLead.title} at {linkedInModal.previewLead.company}</p>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <p className="text-sm text-gray-600 mb-2">Message:</p>
+                <div className="bg-blue-50 border border-blue-200 p-4 rounded-lg">
+                  <p className="text-sm whitespace-pre-wrap">
+                    {linkedInModal.message.replace('[First Name]', linkedInModal.previewLead.first_name)}
+                  </p>
+                  <p className="text-xs text-gray-500 mt-3">
+                    {linkedInModal.message.replace('[First Name]', linkedInModal.previewLead.first_name).length} / 300 characters
+                  </p>
+                </div>
+              </div>
+
+              <button
+                onClick={() => setLinkedInModal({ ...linkedInModal, previewLead: null })}
+                className="mt-4 w-full px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* LinkedIn Campaign Modal */}
+      {linkedInModal.show && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-gray-200">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-2xl font-bold text-gray-900">
+                    {linkedInModal.step === 'select-account' && 'Select LinkedIn Account'}
+                    {linkedInModal.step === 'generate' && 'Generate LinkedIn Message'}
+                    {linkedInModal.step === 'preview' && 'Review & Edit Message'}
+                    {linkedInModal.step === 'confirm' && 'Confirm Lead Selection'}
+                  </h2>
+                  <p className="text-sm text-gray-600 mt-1">
+                    {linkedInModal.campaign?.url}
+                  </p>
+                </div>
+                <button
+                  onClick={() => setLinkedInModal({ show: false, campaign: null, step: 'select-account', message: '', loading: false, leads: [], previewLead: null, accounts: [], selectedAccount: null })}
+                  className="text-gray-400 hover:text-gray-600"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6">
+              {linkedInModal.loading ? (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 className="w-8 h-8 animate-spin text-primary-600" />
+                  <span className="ml-3 text-gray-600">
+                    {linkedInModal.step === 'generate' && 'Analyzing website...'}
+                    {linkedInModal.step === 'preview' && 'Generating message...'}
+                    {linkedInModal.step === 'confirm' && 'Loading leads...'}
+                  </span>
+                </div>
+              ) : (
+                <>
+                  {/* Step 0: Select Account */}
+                  {linkedInModal.step === 'select-account' && (
+                    <div className="py-4">
+                      <h3 className="text-lg font-semibold mb-4">Choose a LinkedIn account:</h3>
+
+                      {linkedInModal.accounts.length > 0 ? (
+                        <div className="space-y-3 mb-6">
+                          {linkedInModal.accounts.map((account: any) => (
+                            <button
+                              key={account.id}
+                              onClick={() => setLinkedInModal({ ...linkedInModal, selectedAccount: account })}
+                              className={`w-full p-4 border-2 rounded-lg text-left transition-colors ${
+                                linkedInModal.selectedAccount?.id === account.id
+                                  ? 'border-blue-600 bg-blue-50'
+                                  : 'border-gray-200 hover:border-blue-300'
+                              }`}
+                            >
+                              <div className="flex items-center gap-3">
+                                <Linkedin className="w-8 h-8 text-blue-600" />
+                                <div>
+                                  <p className="font-medium text-gray-900">{account.name || 'LinkedIn Account'}</p>
+                                  <p className="text-sm text-gray-500">
+                                    Connected: {new Date(account.created_at).toLocaleDateString()}
+                                  </p>
+                                </div>
+                              </div>
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-gray-600 mb-6">No LinkedIn accounts connected yet.</p>
+                      )}
+
+                      <div className="flex items-center justify-between gap-3 pt-4 border-t border-gray-200">
+                        <button
+                          onClick={handleConnectNewLinkedInAccount}
+                          className="px-4 py-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors border border-blue-600"
+                        >
+                          + Connect New Account
+                        </button>
+                        <button
+                          onClick={handleContinueWithAccount}
+                          disabled={!linkedInModal.selectedAccount}
+                          className="px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-medium rounded-lg transition-colors"
+                        >
+                          Continue
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Step 1: Generate Message */}
+                  {linkedInModal.step === 'generate' && (
+                    <div className="text-center py-8">
+                      <Linkedin className="w-16 h-16 mx-auto text-blue-600 mb-4" />
+                      <h3 className="text-xl font-semibold mb-2">Ready to reach your leads on LinkedIn?</h3>
+                      <p className="text-gray-600 mb-6">
+                        We'll analyze your website and generate a personalized message for your target audience.
+                      </p>
+                      <button
+                        onClick={handleGenerateMessage}
+                        className="px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg transition-colors"
+                      >
+                        Generate Message
+                      </button>
+                    </div>
+                  )}
+
+                  {/* Step 2: Preview & Edit Message */}
+                  {linkedInModal.step === 'preview' && (
+                    <>
+                      <div className="mb-4">
+                        <label className="block text-sm font-medium text-gray-700 mb-2">
+                          LinkedIn Message Preview
+                        </label>
+                        <textarea
+                          value={linkedInModal.message}
+                          onChange={(e) => setLinkedInModal({ ...linkedInModal, message: e.target.value })}
+                          className="w-full h-64 px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500 font-mono text-sm"
+                          placeholder="Message will be generated..."
+                        />
+                        <p className="mt-2 text-xs text-gray-500">
+                          Use [First Name] as a placeholder for personalization
+                        </p>
+                      </div>
+
+                      <div className="flex items-center justify-end gap-3">
+                        <button
+                          onClick={() => setLinkedInModal({ ...linkedInModal, step: 'generate' })}
+                          className="px-4 py-2 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                        >
+                          Back
+                        </button>
+                        <button
+                          onClick={handleShowLeadPreview}
+                          disabled={!linkedInModal.message}
+                          className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-medium rounded-lg transition-colors"
+                        >
+                          Continue to Leads
+                        </button>
+                      </div>
+                    </>
+                  )}
+
+                  {/* Step 3: Confirm & Send to Leads */}
+                  {linkedInModal.step === 'confirm' && (
+                    <>
+                      <div className="mb-6">
+                        <h3 className="font-semibold mb-2">Your Message:</h3>
+                        <div className="bg-gray-50 p-4 rounded-lg text-sm whitespace-pre-wrap">
+                          {linkedInModal.message}
+                        </div>
+                      </div>
+
+                      <div className="mb-6">
+                        <h3 className="font-semibold mb-2">Target Leads ({linkedInModal.leads.length} with LinkedIn profiles):</h3>
+                        {linkedInModal.leads.length > 0 ? (
+                          <div className="bg-gray-50 rounded-lg p-3 max-h-64 overflow-y-auto">
+                            <div className="space-y-2">
+                              {linkedInModal.leads.map((lead: any, index: number) => (
+                                <div key={index} className="flex items-start gap-3 p-2 bg-white rounded border border-gray-200">
+                                  <div className="flex-shrink-0 w-10 h-10 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 font-semibold">
+                                    {lead.first_name?.[0] || 'L'}{lead.last_name?.[0] || ''}
+                                  </div>
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-sm font-medium text-gray-900">
+                                      {lead.first_name} {lead.last_name}
+                                    </p>
+                                    <p className="text-xs text-gray-600">{lead.title} at {lead.company}</p>
+                                    <p className="text-xs text-gray-500 truncate">{lead.email}</p>
+                                    {lead.linkedin_url && (
+                                      <a
+                                        href={lead.linkedin_url.startsWith('http') ? lead.linkedin_url : `https://${lead.linkedin_url}`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1 mt-1"
+                                      >
+                                        <Linkedin className="w-3 h-3" />
+                                        View LinkedIn Profile
+                                      </a>
+                                    )}
+                                  </div>
+                                  <button
+                                    onClick={() => setLinkedInModal({ ...linkedInModal, previewLead: lead })}
+                                    className="flex-shrink-0 px-3 py-1 text-xs bg-blue-50 text-blue-600 hover:bg-blue-100 rounded transition-colors"
+                                  >
+                                    Preview
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-sm text-gray-600 mb-3">
+                            Loading leads from {linkedInModal.campaign?.target_audience}...
+                          </p>
+                        )}
+
+                        <div className="bg-blue-50 border border-blue-200 p-3 rounded-lg text-xs text-blue-800 mt-3">
+                          <strong>How it works:</strong>
+                          <ul className="list-disc ml-4 mt-1 space-y-1">
+                            <li>If you're already connected with a lead, they'll receive a direct message</li>
+                            <li>If you're not connected, they'll receive a connection request with your message as a note (max 300 characters)</li>
+                          </ul>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center justify-end gap-3">
+                        <button
+                          onClick={() => setLinkedInModal({ ...linkedInModal, step: 'preview' })}
+                          className="px-4 py-2 text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+                        >
+                          Back
+                        </button>
+                        <button
+                          onClick={launchLinkedInCampaign}
+                          disabled={!linkedInModal.message || linkedInModal.loading || linkedInModal.leads.length === 0}
+                          className="flex items-center gap-2 px-6 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white font-medium rounded-lg transition-colors"
+                        >
+                          <Linkedin className="w-4 h-4" />
+                          Confirm & Send to {linkedInModal.leads.length} Lead{linkedInModal.leads.length !== 1 ? 's' : ''}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
