@@ -20,20 +20,25 @@ class AICopyService:
         Returns: [{"subject": "...", "body": "..."}, ...]
         """
 
-        prompt = f"""Visit {url} using web search to analyze what this product/service does. Then create 3 cold email variants for: {target_audience}
+        prompt = f"""Visit {url} using web search to analyze what this product/service does.
+
+IMPORTANT: You are writing cold emails FROM the company at {url} TO their ideal customer profile (ICP): {target_audience}
+
+Create 3 cold email variants specifically tailored for {target_audience}:
 
 Each email must:
 - Have a subject line under 50 characters
 - Be 150-200 words
 - Open with {{{{firstName}}}} and {{{{company}}}}
-- Identify a SPECIFIC pain point for {target_audience}
-- Present the product as the solution using website insights
+- Identify a SPECIFIC pain point that {target_audience} faces in their role/industry
+- Explain how the product/service from {url} solves this pain point (based on what you learned from the website)
 - Include a clear CTA
-- Be conversational (NO generic phrases like "streamline workflows")
+- Be conversational and personalized to {target_audience} (NO generic phrases like "streamline workflows")
+- Demonstrate understanding of {target_audience}'s specific challenges and goals
 
-Variant 1: Pain point → Solution
-Variant 2: Benefit/outcome-focused
-Variant 3: Question/curiosity approach
+Variant 1: Pain point → Solution (focus on a specific problem {target_audience} faces)
+Variant 2: Benefit/outcome-focused (focus on results {target_audience} wants to achieve)
+Variant 3: Question/curiosity approach (ask a thought-provoking question relevant to {target_audience})
 
 CRITICAL: Return ONLY the JSON array below. NO explanations, NO markdown, NO extra text. Start your response with [ and end with ]:
 
